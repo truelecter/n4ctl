@@ -1,0 +1,7 @@
+/target
+/config.toml
+/mapping.toml
+*.log
+.env
+/assets-local
+Cargo.lock

@@ -1,0 +1,46 @@
+[package]
+name = "n4ctl"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone controller for Mirabox N4 (keys + sensor strip + knobs)"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "n4ctl"
+path = "src/main.rs"
+
+[dependencies]
+mirajazz = "0.13"
+tokio = { version = "1", features = ["full"] }
+futures-lite = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+notify = "6"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
+obws = { version = "0.14", features = ["events"] }
+enigo = "0.3"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+libloading = "0.8"
+arc-swap = "1"
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Variant",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

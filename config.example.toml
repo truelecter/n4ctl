@@ -1,0 +1,61 @@
+# n4ctl example config. Copy to `config.toml` alongside the .exe and edit.
+#
+# Slot ids (Mirabox N4, top -> bottom):
+#   key_0 .. key_4     - row 1 (upper), keys 1.1 .. 1.5
+#   key_5 .. key_9     - row 2 (lower), keys 2.1 .. 2.5
+#   strip_0 .. strip_3 - sensor strip, zones 3.1 .. 3.4 (4 zones, with LEDs)
+#   knob_0 .. knob_3   - rotary encoders 4.1 .. 4.4
+
+[device]
+brightness = 60                 # 0..100
+
+[obs]
+url = "ws://127.0.0.1:4455"
+password_env = "OBS_PASSWORD"   # set the env var; or use `password = "..."` directly
+
+[voicemeeter]
+flavor = "potato"
+
+# --- Pages ------------------------------------------------------------------
+
+[[pages]]
+name = "main"
+default = true
+
+[pages.slots.key_0]
+image = "assets/obs_game.png"
+on_press = { action = "obs.scene", scene = "Game" }
+
+[pages.slots.key_1]
+image = "assets/obs_vcam_off.png"
+image_on = "assets/obs_vcam_on.png"
+on_press = { action = "obs.virtual_cam" }
+
+[pages.slots.key_9]
+image = "assets/next_page.png"
+on_press = { action = "page.next" }
+
+[pages.slots.knob_0]
+# Rotate to trim mic gain, press to mute
+on_rotate = { action = "voicemeeter.gain", target = "Strip", index = 0, step = 1.0 }
+on_press  = { action = "voicemeeter.mute", target = "Strip", index = 0 }
+
+[pages.slots.knob_1]
+# Rotate for system output volume (2% per tick)
+on_rotate = { action = "system.volume", step = 2 }
+
+[pages.slots.strip_0]
+# Push-to-mute binding that Discord listens for
+on_press = { action = "hotkey", keys = ["Ctrl", "Shift", "M"] }
+
+# --- Second page ------------------------------------------------------------
+
+[[pages]]
+name = "media"
+
+[pages.slots.key_0]
+on_press = { action = "hotkey", keys = ["MediaPlayPause"] }
+
+[pages.slots.key_9]
+image = "assets/prev_page.png"
+on_press = { action = "page.prev" }
