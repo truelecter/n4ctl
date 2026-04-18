@@ -6,6 +6,7 @@ mod inputs;
 mod mapping;
 mod render;
 mod state;
+mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -35,6 +36,14 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Apply brightness and start from a blank state; shared by `run_session`,
+/// `run_probe_mode`, and `run_map_mode`.
+async fn prepare_device(dev: &mirajazz::device::Device, brightness: u8) {
+    dev.set_brightness(brightness).await.ok();
+    dev.clear_all_button_images().await.ok();
+    dev.flush().await.ok();
+}
+
 async fn list_devices() -> Result<()> {
     let found = device::find_connected().await.context("enumerating devices")?;
     if found.is_empty() {
@@ -58,9 +67,7 @@ async fn run_probe_mode(max: u8, dwell_ms: u64) -> Result<()> {
     info!("Watch the device and write down which PHYSICAL position lights up for each idx.");
 
     let dev = device::open_first().await?;
-    dev.set_brightness(70).await.ok();
-    dev.clear_all_button_images().await.ok();
-    dev.flush().await.ok();
+    prepare_device(&dev, 70).await;
 
     let fmt = render::key_format();
     // Use a bright color so it's impossible to miss.
@@ -109,9 +116,7 @@ async fn run_map_mode() -> Result<()> {
     info!("Pressed key will flash green; released key will flash blue and then clear.");
 
     let dev = device::open_first().await?;
-    dev.set_brightness(60).await.ok();
-    dev.clear_all_button_images().await.ok();
-    dev.flush().await.ok();
+    prepare_device(&dev, 60).await;
 
     let green = render::solid_tile([32, 200, 64]);
     let blue = render::solid_tile([40, 80, 220]);
@@ -185,13 +190,11 @@ async fn run_session(config_path: &std::path::Path) -> Result<()> {
         }
     };
     let brightness = cfg.device.brightness.unwrap_or(60);
-    dev.set_brightness(brightness).await.ok();
-    dev.clear_all_button_images().await.ok();
-    dev.flush().await.ok();
+    prepare_device(&dev, brightness).await;
 
     let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
-    let app = AppState::new(cfg, dev, evt_tx.clone()).await?;
+    let app = AppState::new(cfg, dev).await?;
     app.render_current_page().await?;
 
     // Separate channel to signal device failure from the input task.

@@ -27,6 +27,13 @@ pub fn key_format() -> ImageFormat {
     }
 }
 
+/// Key tile size as `(u32, u32)`; avoids repeating the `as u32` casts that most
+/// pixel-layout math needs.
+fn key_size_u32() -> (u32, u32) {
+    let (w, h) = key_format().size;
+    (w as u32, h as u32)
+}
+
 /// Loaded artwork for one key: a single bitmap or an animated GIF (frames + delays).
 pub enum KeyImage {
     Static(DynamicImage),
@@ -117,8 +124,8 @@ fn gif_frame_delay_ms(delay: image::Delay) -> u32 {
 
 /// A solid-color placeholder tile at the key size (used as fallback / clear).
 pub fn solid_tile(rgb: [u8; 3]) -> DynamicImage {
-    let (w, h) = key_format().size;
-    let mut buf = image::RgbImage::new(w as u32, h as u32);
+    let (w, h) = key_size_u32();
+    let mut buf = image::RgbImage::new(w, h);
     for p in buf.pixels_mut() {
         *p = image::Rgb(rgb);
     }
@@ -127,9 +134,7 @@ pub fn solid_tile(rgb: [u8; 3]) -> DynamicImage {
 
 /// Local-time tile: top row = hours (`%H`), bottom row = minutes (`%M`); 8×8 glyphs at 4× scale.
 pub fn render_clock_image(now: DateTime<Local>) -> DynamicImage {
-    let (tw, th) = key_format().size;
-    let tw = tw as u32;
-    let th = th as u32;
+    let (tw, th) = key_size_u32();
     let scale = 4u32;
     let gap = 2u32;
     let row_h = 8 * scale;
@@ -162,40 +167,66 @@ fn rect_fill(
     }
 }
 
-fn blit_text_scaled(
+/// Draw a rectangular bar: flat `track` fill with a 1px `border` outline.
+///
+/// Returns the interior rectangle `(inner_x, inner_y, inner_w, inner_h)` suitable
+/// for subsequent fill calls, where `inner_*` = the 2-pixel-inset region that
+/// `draw_bar_fill_*` expects.
+fn draw_bar(
     img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
-    text: &str,
-    mut x: u32,
-    y: u32,
-    scale: u32,
-    fg: Rgb<u8>,
+    bx: u32,
+    by: u32,
+    bw: u32,
+    bh: u32,
+    track: Rgb<u8>,
+    border: Rgb<u8>,
     tw: u32,
     th: u32,
-    gap: u32,
+) -> (u32, u32, u32, u32) {
+    rect_fill(img, bx, by, bw, bh, track, tw, th);
+    rect_fill(img, bx, by, 1, bh, border, tw, th);
+    rect_fill(img, bx + bw - 1, by, 1, bh, border, tw, th);
+    rect_fill(img, bx, by, bw, 1, border, tw, th);
+    rect_fill(img, bx, by + bh - 1, bw, 1, border, tw, th);
+    (bx + 2, by + 2, bw.saturating_sub(4), bh.saturating_sub(4))
+}
+
+/// Flat-color fill of a bar interior to `level` (0.0..=1.0 of `inner_w`).
+fn draw_bar_fill_solid(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    inner: (u32, u32, u32, u32),
+    level: f32,
+    color: Rgb<u8>,
+    tw: u32,
+    th: u32,
 ) {
-    let char_w = 8 * scale;
-    for ch in text.chars() {
-        let rows = UnicodeFonts::get(&font8x8::BASIC_FONTS, ch)
-            .or_else(|| UnicodeFonts::get(&font8x8::BASIC_FONTS, '?'))
-            .expect("font8x8 fallback");
-        for row in 0u32..8 {
-            let bits = rows[row as usize];
-            for col in 0u32..8 {
-                let on = bits & (1 << col) != 0;
-                if on {
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            let px = x + col * scale + dx;
-                            let py = y + row * scale + dy;
-                            if px < tw && py < th {
-                                img.put_pixel(px, py, fg);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        x = x.saturating_add(char_w.saturating_add(gap));
+    let (ix, iy, iw, ih) = inner;
+    let level = level.clamp(0.0, 1.0);
+    let fill_w = ((iw as f32) * level).round() as u32;
+    let fill_w = fill_w.max(if level > 0.0 { 1 } else { 0 }).min(iw);
+    rect_fill(img, ix, iy, fill_w, ih, color, tw, th);
+}
+
+/// Per-column gradient fill: `color_at_frac(x/inner_w)` is evaluated for each
+/// filled column to produce a horizontal gradient up to `level`.
+fn draw_bar_fill_gradient<F>(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    inner: (u32, u32, u32, u32),
+    level: f32,
+    mut color_at_frac: F,
+    tw: u32,
+    th: u32,
+) where
+    F: FnMut(f32) -> Rgb<u8>,
+{
+    let (ix, iy, iw, ih) = inner;
+    let level = level.clamp(0.0, 1.0);
+    let fill_w = ((iw as f32) * level).round() as u32;
+    let fill_w = fill_w.max(if level > 0.001 { 1 } else { 0 }).min(iw);
+    for xi in 0..fill_w {
+        let frac = (xi as f32 + 0.5) / iw as f32;
+        let c = color_at_frac(frac);
+        rect_fill(img, ix + xi, iy, 1, ih, c, tw, th);
     }
 }
 
@@ -255,15 +286,13 @@ fn blit_text_centered_row(
     let n = text.chars().count() as u32;
     let text_w = n.saturating_mul(char_w).saturating_add(n.saturating_sub(1).saturating_mul(gap));
     let x0 = tw.saturating_sub(text_w) / 2;
-    blit_text_scaled(img, text, x0, y, scale, fg, tw, th, gap);
+    blit_text_scaled_rational(img, text, x0, y, scale, 1, fg, tw, th, gap);
 }
 
 /// Default playback volume 0.0..=1.0: centered `SYS`, horizontal bar below, then `000%`.
 pub fn render_system_volume_meter(level: f32) -> DynamicImage {
     let level = level.clamp(0.0, 1.0);
-    let (tw, th) = key_format().size;
-    let tw = tw as u32;
-    let th = th as u32;
+    let (tw, th) = key_size_u32();
     let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(tw, th, Rgb([0u8, 0u8, 0u8]));
     let fg_label = Rgb([200u8, 200u8, 200u8]);
     let label_y = 4u32;
@@ -276,20 +305,12 @@ pub fn render_system_volume_meter(level: f32) -> DynamicImage {
     let bh = 22u32;
     let track = Rgb([42u8, 42u8, 42u8]);
     let border = Rgb([130u8, 130u8, 130u8]);
-    rect_fill(&mut img, bx, by, bw, bh, track, tw, th);
-    rect_fill(&mut img, bx, by, 1, bh, border, tw, th);
-    rect_fill(&mut img, bx + bw - 1, by, 1, bh, border, tw, th);
-    rect_fill(&mut img, bx, by, bw, 1, border, tw, th);
-    rect_fill(&mut img, bx, by + bh - 1, bw, 1, border, tw, th);
+    let inner = draw_bar(&mut img, bx, by, bw, bh, track, border, tw, th);
 
-    let inner_w = bw.saturating_sub(4);
-    let inner_h = bh.saturating_sub(4);
-    let fill_w = ((inner_w as f32) * level).round() as u32;
-    let fill_w = fill_w.max(if level > 0.0 { 1 } else { 0 }).min(inner_w);
     let r = (255.0 * level) as u8;
     let g = (200.0 * (1.0 - level)) as u8;
     let fill_rgb = Rgb([r, g.saturating_add(40), 48u8]);
-    rect_fill(&mut img, bx + 2, by + 2, fill_w, inner_h, fill_rgb, tw, th);
+    draw_bar_fill_solid(&mut img, inner, level, fill_rgb, tw, th);
 
     let pct = (level * 100.0).round().clamp(0.0, 100.0) as i32;
     let value = format!("{pct:03}%");
@@ -329,9 +350,7 @@ pub fn render_voicemeeter_gain_meter(db: f32, label: &str) -> DynamicImage {
     let db = db.clamp(VM_GAIN_MIN_DB, VM_GAIN_MAX_DB);
     let span = VM_GAIN_MAX_DB - VM_GAIN_MIN_DB;
     let n = ((db - VM_GAIN_MIN_DB) / span).clamp(0.0, 1.0);
-    let (tw, th) = key_format().size;
-    let tw = tw as u32;
-    let th = th as u32;
+    let (tw, th) = key_size_u32();
     let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(tw, th, Rgb([0u8, 0u8, 0u8]));
 
     let db_i = db.round() as i32;
@@ -390,24 +409,16 @@ pub fn render_voicemeeter_gain_meter(db: f32, label: &str) -> DynamicImage {
 
     let track = Rgb([42u8, 42u8, 42u8]);
     let border = Rgb([130u8, 130u8, 130u8]);
-    rect_fill(&mut img, bx, by, bw, bh, track, tw, th);
-    rect_fill(&mut img, bx, by, 1, bh, border, tw, th);
-    rect_fill(&mut img, bx + bw - 1, by, 1, bh, border, tw, th);
-    rect_fill(&mut img, bx, by, bw, 1, border, tw, th);
-    rect_fill(&mut img, bx, by + bh - 1, bw, 1, border, tw, th);
+    let inner = draw_bar(&mut img, bx, by, bw, bh, track, border, tw, th);
 
-    let inner_w = bw.saturating_sub(4);
-    let inner_h = bh.saturating_sub(4);
-    let fill_w = ((inner_w as f32) * n).round() as u32;
-    let fill_w = fill_w.max(if n > 0.001 { 1 } else { 0 }).min(inner_w);
-    let fill_x0 = bx + 2;
-    let fill_y0 = by + 2;
-    for xi in 0..fill_w {
-        let frac = (xi as f32 + 0.5) / inner_w as f32;
-        let db_x = VM_GAIN_MIN_DB + frac * span;
-        let c = vm_bar_color_for_db(db_x);
-        rect_fill(&mut img, fill_x0 + xi, fill_y0, 1, inner_h, c, tw, th);
-    }
+    draw_bar_fill_gradient(
+        &mut img,
+        inner,
+        n,
+        |frac| vm_bar_color_for_db(VM_GAIN_MIN_DB + frac * span),
+        tw,
+        th,
+    );
 
     DynamicImage::ImageRgb8(img)
 }
@@ -415,9 +426,7 @@ pub fn render_voicemeeter_gain_meter(db: f32, label: &str) -> DynamicImage {
 /// Placeholder when a volume source is unavailable (e.g. Voicemeeter on non-Windows).
 #[cfg(not(windows))]
 pub fn render_volume_stub(message: &str) -> DynamicImage {
-    let (tw, th) = key_format().size;
-    let tw = tw as u32;
-    let th = th as u32;
+    let (tw, th) = key_size_u32();
     let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(tw, th, Rgb([24u8, 20u8, 28u8]));
     blit_text_centered_row(
         &mut img,

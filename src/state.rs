@@ -6,10 +6,12 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use image::DynamicImage;
 use mirajazz::device::Device;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -20,6 +22,7 @@ use crate::{
     config::{Config, Slot, resolve_asset},
     mapping::{InputEvent, SlotId},
     render,
+    util::lock_sync,
 };
 
 /// Shared handle passed to tasks that need to poke state (config reload).
@@ -36,10 +39,10 @@ pub struct StateInner {
     pub vm_mute_latch: Mutex<HashMap<(String, u32), bool>>,
     pub device: Arc<Device>,
     pub reload_tx: mpsc::UnboundedSender<Reload>,
-    /// One GIF playback task per displayed slot (full page or overlay); replaced on state change.
-    pub slot_gif_tasks: std::sync::Mutex<HashMap<SlotId, tokio::task::JoinHandle<()>>>,
-    /// Periodic redraw tasks: live clock, volume meters, etc. (one handle per such slot).
-    pub clock_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// One background redraw task per displayed slot — covers GIF playback,
+    /// clocks, and system / voicemeeter volume meters. Inserting for a slot
+    /// aborts any previous task for the same slot.
+    pub slot_tasks: std::sync::Mutex<HashMap<SlotId, tokio::task::JoinHandle<()>>>,
     /// Bumped at the start of every full re-render so GIF loops stop before HID
     /// writes even when `abort`/`await` does not preempt an in-flight transfer.
     pub gif_display_epoch: AtomicU64,
@@ -48,24 +51,18 @@ pub struct StateInner {
     /// Voicemeeter mute poll task is started once after the first successful Remote init.
     pub vm_mute_poll_started: AtomicBool,
     /// Wakes volume meter background tasks right after encoder-driven level changes.
-    pub volume_meter_wake: Arc<Notify>,
+    pub volume_meter_wake: Notify,
 }
 
 impl StateInner {
-    /// Cancel GIF and clock tasks without awaiting (only safe when the device is going away).
-    fn abort_gif_loops_best_effort(&self) {
-        let handles: Vec<_> = match self.slot_gif_tasks.lock() {
-            Ok(mut tasks) => tasks.drain().map(|(_, h)| h).collect(),
-            Err(poisoned) => poisoned.into_inner().drain().map(|(_, h)| h).collect(),
-        };
+    /// Cancel every per-slot redraw task without awaiting. Safe fallback for
+    /// `Drop`, where we cannot run async code.
+    fn abort_all_slot_tasks_best_effort(&self) {
+        let handles: Vec<_> = lock_sync(&self.slot_tasks)
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for h in handles {
-            h.abort();
-        }
-        let clock_handles: Vec<_> = match self.clock_tasks.lock() {
-            Ok(mut tasks) => tasks.drain(..).collect(),
-            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-        };
-        for h in clock_handles {
             h.abort();
         }
     }
@@ -73,7 +70,7 @@ impl StateInner {
 
 impl Drop for StateInner {
     fn drop(&mut self) {
-        self.abort_gif_loops_best_effort();
+        self.abort_all_slot_tasks_best_effort();
     }
 }
 
@@ -88,7 +85,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(cfg: Config, device: Device, _evt_tx: mpsc::UnboundedSender<InputEvent>) -> Result<Self> {
+    pub async fn new(cfg: Config, device: Device) -> Result<Self> {
         let initial_page = cfg
             .pages
             .iter()
@@ -107,12 +104,11 @@ impl AppState {
             vm_mute_latch: Mutex::new(HashMap::new()),
             device: Arc::new(device),
             reload_tx,
-            slot_gif_tasks: std::sync::Mutex::new(HashMap::new()),
-            clock_tasks: std::sync::Mutex::new(Vec::new()),
+            slot_tasks: std::sync::Mutex::new(HashMap::new()),
             gif_display_epoch: AtomicU64::new(0),
             action_ctx: StdMutex::new(None),
             vm_mute_poll_started: AtomicBool::new(false),
-            volume_meter_wake: Arc::new(Notify::new()),
+            volume_meter_wake: Notify::new(),
         });
 
         let ctx = Arc::new(ActionContext::new(inner.clone()).await);
@@ -198,16 +194,89 @@ impl AppState {
 }
 
 fn slot_for(page: &crate::config::Page, slot: SlotId) -> Option<&Slot> {
-    let key = slot_to_config_key(slot);
-    page.slots.get(&key)
+    page.slots.get(&slot.to_config_key())
 }
 
-fn slot_to_config_key(slot: SlotId) -> String {
-    match slot {
-        SlotId::Key(n) => format!("key_{n}"),
-        SlotId::Strip(n) => format!("strip_{n}"),
-        SlotId::Knob(n) => format!("knob_{n}"),
-        SlotId::Swipe => "swipe".to_string(),
+fn choose_slot_image(slot: &Slot, state: u8) -> Option<String> {
+    if state >= 1 {
+        slot.image_on.clone().or_else(|| slot.image.clone())
+    } else {
+        slot.image.clone()
+    }
+}
+
+/// What to display in a single slot for the current (config, state) pair.
+///
+/// Produced by [`classify_slot`]; consumed by [`AppHandle::paint_slot`]. The
+/// split lets the full-page and overlay render paths share almost everything,
+/// with the overlay skipping only the "live" variants (clock / meters) that
+/// already have a running periodic task.
+enum SlotRender {
+    Clock,
+    SysMeter,
+    #[cfg(windows)]
+    VmMeter {
+        target: crate::actions::voicemeeter::VmTarget,
+        label: String,
+    },
+    #[cfg(not(windows))]
+    VmMeterStub,
+    /// Voicemeeter target string couldn't be parsed; surface a red tile and log.
+    VmInvalid(String),
+    Static(DynamicImage),
+    Gif {
+        frames: Vec<DynamicImage>,
+        delays_ms: Vec<u32>,
+    },
+    /// No image configured — clear the slot.
+    Clear,
+}
+
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn classify_slot(cfg: &Config, slot_cfg: &Slot, state: u8) -> SlotRender {
+    if slot_cfg.clock {
+        return SlotRender::Clock;
+    }
+    if let Some(vm_disp) = &slot_cfg.volume_display_voicemeeter {
+        #[cfg(windows)]
+        {
+            return match crate::actions::voicemeeter::VmTarget::parse(
+                &vm_disp.target,
+                vm_disp.index,
+            ) {
+                Ok(target) => {
+                    let label = target.label();
+                    SlotRender::VmMeter { target, label }
+                }
+                Err(e) => SlotRender::VmInvalid(format!("{e}")),
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = vm_disp;
+            return SlotRender::VmMeterStub;
+        }
+    }
+    if slot_cfg.volume_display_system {
+        return SlotRender::SysMeter;
+    }
+    let Some(rel) = choose_slot_image(slot_cfg, state) else {
+        return SlotRender::Clear;
+    };
+    let path = resolve_asset(cfg, &rel);
+    match render::load_key_visual(&path) {
+        Ok(render::KeyImage::Static(img)) => SlotRender::Static(img),
+        Ok(render::KeyImage::Animated { frames, delays_ms }) => {
+            if frames.is_empty() {
+                SlotRender::Clear
+            } else {
+                SlotRender::Gif { frames, delays_ms }
+            }
+        }
+        Err(e) => {
+            warn!("load image {}: {:#}", path.display(), e);
+            SlotRender::Clear
+        }
     }
 }
 
@@ -219,20 +288,15 @@ impl AppHandle {
 
     /// Stop GIF loops and wait until they cannot send another frame (avoids stale
     /// frames after `clear_all_button_images` / page change).
+    /// Abort every slot redraw task (GIF/clock/meter) and wait until they no
+    /// longer send device frames — avoids stale frames after a full re-render
+    /// or teardown.
     pub async fn shutdown_gif_tasks(&self) {
-        let handles: Vec<tokio::task::JoinHandle<()>> = match self.inner.slot_gif_tasks.lock() {
-            Ok(mut tasks) => tasks.drain().map(|(_, h)| h).collect(),
-            Err(poisoned) => poisoned.into_inner().drain().map(|(_, h)| h).collect(),
-        };
+        let handles: Vec<tokio::task::JoinHandle<()>> = lock_sync(&self.inner.slot_tasks)
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for h in handles {
-            h.abort();
-            let _ = h.await;
-        }
-        let clock_handles: Vec<tokio::task::JoinHandle<()>> = match self.inner.clock_tasks.lock() {
-            Ok(mut tasks) => tasks.drain(..).collect(),
-            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-        };
-        for h in clock_handles {
             h.abort();
             let _ = h.await;
         }
@@ -255,75 +319,19 @@ impl AppHandle {
             return Ok(());
         };
         let states = self.inner.slot_states.lock().await.clone();
-        let fmt = render::key_format();
+        // Reuse the current epoch: overlay doesn't invalidate other slots' running tasks,
+        // it only aborts+replaces tasks on the slots it's redrawing (via `slot_tasks`).
+        let this_epoch = self.inner.gif_display_epoch.load(Ordering::Acquire);
 
         for &slot_id in slots {
             let Some(image_idx) = slot_id.image_index() else {
                 continue;
             };
-            let key = slot_to_config_key(slot_id);
-            let Some(slot_cfg) = page.slots.get(&key) else {
+            let Some(slot_cfg) = page.slots.get(&slot_id.to_config_key()) else {
                 continue;
             };
-            if slot_cfg.clock
-                || slot_cfg.volume_display_system
-                || slot_cfg.volume_display_voicemeeter.is_some()
-            {
-                continue;
-            }
-            let image = choose_slot_image(slot_cfg, *states.get(&slot_id).unwrap_or(&0));
-            let Some(rel) = image else {
-                let _ = self.inner.device.clear_button_image(image_idx).await;
-                continue;
-            };
-            let path = resolve_asset(&cfg, &rel);
-            match render::load_key_visual(&path) {
-                Ok(render::KeyImage::Static(img)) => {
-                    if let Ok(mut m) = self.inner.slot_gif_tasks.lock() {
-                        if let Some(h) = m.remove(&slot_id) {
-                            h.abort();
-                        }
-                    }
-                    if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await {
-                        warn!("set_button_image overlay {slot_id:?} (idx={image_idx}): {e}");
-                    }
-                }
-                Ok(render::KeyImage::Animated { frames, delays_ms }) => {
-                    if frames.is_empty() {
-                        continue;
-                    }
-                    let this_epoch = self.inner.gif_display_epoch.load(Ordering::Acquire);
-                    let device = self.inner.device.clone();
-                    let gif_epoch = self.inner.clone();
-                    let fmt_spawn = fmt.clone();
-                    let handle = tokio::spawn(async move {
-                        let mut i = 0usize;
-                        loop {
-                            if gif_epoch.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let img = frames[i].clone();
-                            if device.set_button_image(image_idx, fmt_spawn.clone(), img).await.is_err() {
-                                break;
-                            }
-                            if gif_epoch.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let _ = device.flush().await;
-                            let delay = delays_ms.get(i).copied().unwrap_or(100);
-                            let delay = delay.clamp(16, 10_000);
-                            tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-                            i = (i + 1) % frames.len();
-                        }
-                    });
-                    if let Ok(mut m) = self.inner.slot_gif_tasks.lock() {
-                        if let Some(old) = m.insert(slot_id, handle) {
-                            old.abort();
-                        }
-                    }
-                }
-                Err(e) => warn!("load overlay image {}: {:#}", path.display(), e),
-            }
+            let kind = classify_slot(&cfg, slot_cfg, *states.get(&slot_id).unwrap_or(&0));
+            self.paint_slot(slot_id, image_idx, kind, this_epoch, false).await;
         }
         self.inner.device.flush().await.ok();
         Ok(())
@@ -349,147 +357,128 @@ impl AppHandle {
         self.inner.device.clear_all_button_images().await.ok();
         self.inner.device.flush().await.ok();
 
-        let fmt = render::key_format();
-        let inner_for_gif = self.inner.clone();
         for slot_id in SlotId::all_displayed() {
             let Some(image_idx) = slot_id.image_index() else { continue };
-            let key = slot_to_config_key(slot_id);
-            let Some(slot_cfg) = page.slots.get(&key) else {
+            let Some(slot_cfg) = page.slots.get(&slot_id.to_config_key()) else {
                 let _ = self.inner.device.clear_button_image(image_idx).await;
                 continue;
             };
-            if slot_cfg.clock {
+            let kind = classify_slot(&cfg, slot_cfg, *states.get(&slot_id).unwrap_or(&0));
+            self.paint_slot(slot_id, image_idx, kind, this_epoch, true).await;
+        }
+        self.inner.device.flush().await.ok();
+        Ok(())
+    }
+
+    /// Apply a [`SlotRender`] decision to the device. The two render paths
+    /// (full page + overlay) share this; `allow_live=false` skips clock/meter
+    /// variants (their background tasks are already running and must not be
+    /// restarted on overlay redraws).
+    async fn paint_slot(
+        &self,
+        slot_id: SlotId,
+        image_idx: u8,
+        kind: SlotRender,
+        this_epoch: u64,
+        allow_live: bool,
+    ) {
+        let fmt = render::key_format();
+        match kind {
+            SlotRender::Clock if allow_live => {
                 let img = render::render_clock_image(chrono::Local::now());
-                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await {
+                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt, img).await {
                     warn!("set_button_image clock {slot_id:?} (idx={image_idx}): {e}");
                 }
-                let device = self.inner.device.clone();
-                let epoch_holder = inner_for_gif.clone();
-                let fmt_clock = fmt.clone();
-                let handle = tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                    loop {
-                        tick.tick().await;
-                        if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                            return;
-                        }
-                        let img = render::render_clock_image(chrono::Local::now());
-                        if device.set_button_image(image_idx, fmt_clock.clone(), img).await.is_err() {
-                            break;
-                        }
-                        if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                            return;
-                        }
-                        let _ = device.flush().await;
-                    }
-                });
-                match self.inner.clock_tasks.lock() {
-                    Ok(mut tasks) => tasks.push(handle),
-                    Err(poisoned) => poisoned.into_inner().push(handle),
-                }
-                continue;
+                self.spawn_refresh_task(
+                    slot_id,
+                    image_idx,
+                    Duration::from_secs(1),
+                    false,
+                    this_epoch,
+                    move || async move {
+                        Some(render::render_clock_image(chrono::Local::now()))
+                    },
+                );
             }
-            if let Some(vm_disp) = &slot_cfg.volume_display_voicemeeter {
-                #[cfg(not(windows))]
+            #[cfg(windows)]
+            SlotRender::VmMeter { target, label } if allow_live => {
+                let Some(actx) = self.action_context() else {
+                    warn!("voicemeeter volume display: action context not wired for {slot_id:?}");
+                    let img = render::solid_tile([40u8, 12u8, 12u8]);
+                    let _ = self.inner.device.set_button_image(image_idx, fmt, img).await;
+                    return;
+                };
+                let holder = actx.vm.clone();
+                let (db0, created0) = match tokio::task::spawn_blocking({
+                    let h = holder.clone();
+                    let t = target.clone();
+                    move || crate::actions::voicemeeter::vm_init_and_read_gain_db(&h, &t)
+                })
+                .await
                 {
-                    let _ = vm_disp;
-                    let img = render::render_volume_stub("NO VM");
-                    if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await {
-                        warn!("set_button_image vm volume stub {slot_id:?} (idx={image_idx}): {e}");
-                    }
-                    continue;
-                }
-                #[cfg(windows)]
-                {
-                    let target = vm_disp.target.clone();
-                    let index = vm_disp.index;
-                    let label = if target.eq_ignore_ascii_case("bus") {
-                        format!("B{index}")
-                    } else if target.eq_ignore_ascii_case("strip") {
-                        format!("S{index}")
-                    } else {
-                        format!("?{index}")
-                    };
-                    let Some(actx) = self.action_context() else {
-                        warn!("voicemeeter volume display: action context not wired for {slot_id:?}");
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        warn!("voicemeeter volume display read failed for {slot_id:?}: {e}");
                         let img = render::solid_tile([40u8, 12u8, 12u8]);
-                        let _ = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await;
-                        continue;
-                    };
-                    let holder = actx.vm.clone();
-                    let (db0, created0) = match tokio::task::spawn_blocking({
+                        let _ = self.inner.device.set_button_image(image_idx, fmt, img).await;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("voicemeeter volume display join error {slot_id:?}: {e}");
+                        let img = render::solid_tile([40u8, 12u8, 12u8]);
+                        let _ = self.inner.device.set_button_image(image_idx, fmt, img).await;
+                        return;
+                    }
+                };
+                crate::actions::voicemeeter::try_spawn_vm_mute_poll_after_init(
+                    actx.as_ref(),
+                    created0,
+                );
+                let img0 = render::render_voicemeeter_gain_meter(db0, &label);
+                if let Err(e) = self
+                    .inner
+                    .device
+                    .set_button_image(image_idx, fmt, img0)
+                    .await
+                {
+                    warn!("set_button_image vm volume {slot_id:?} (idx={image_idx}): {e}");
+                }
+                self.spawn_refresh_task(
+                    slot_id,
+                    image_idx,
+                    Duration::from_millis(100),
+                    true,
+                    this_epoch,
+                    move || {
                         let h = holder.clone();
                         let t = target.clone();
-                        move || crate::actions::voicemeeter::vm_init_and_read_gain_db(&h, &t, index)
-                    })
-                    .await
-                    {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            warn!("voicemeeter volume display read failed for {slot_id:?}: {e}");
-                            let img = render::solid_tile([40u8, 12u8, 12u8]);
-                            let _ = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!("voicemeeter volume display join error {slot_id:?}: {e}");
-                            let img = render::solid_tile([40u8, 12u8, 12u8]);
-                            let _ = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await;
-                            continue;
-                        }
-                    };
-                    crate::actions::voicemeeter::try_spawn_vm_mute_poll_after_init(actx.as_ref(), created0);
-                    let img0 = render::render_voicemeeter_gain_meter(db0, &label);
-                    if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img0).await {
-                        warn!("set_button_image vm volume {slot_id:?} (idx={image_idx}): {e}");
-                    }
-                    let device = self.inner.device.clone();
-                    let epoch_holder = inner_for_gif.clone();
-                    let meter_wake = inner_for_gif.volume_meter_wake.clone();
-                    let fmt_vm = fmt.clone();
-                    let target_loop = target.clone();
-                    let label_loop = label.clone();
-                    let handle = tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                        loop {
-                            tokio::select! {
-                                biased;
-                                _ = meter_wake.notified() => {}
-                                _ = tick.tick() => {}
-                            }
-                            if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let h = holder.clone();
-                            let t = target_loop.clone();
-                            let db = match tokio::task::spawn_blocking(move || {
-                                crate::actions::voicemeeter::vm_init_and_read_gain_db(&h, &t, index)
+                        let label = label.clone();
+                        async move {
+                            let db = tokio::task::spawn_blocking(move || {
+                                crate::actions::voicemeeter::vm_init_and_read_gain_db(&h, &t)
                                     .map(|(d, _)| d)
                             })
                             .await
-                            {
-                                Ok(Ok(v)) => v,
-                                Ok(Err(_)) | Err(_) => continue,
-                            };
-                            let img = render::render_voicemeeter_gain_meter(db, &label_loop);
-                            if device.set_button_image(image_idx, fmt_vm.clone(), img).await.is_err() {
-                                break;
-                            }
-                            if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let _ = device.flush().await;
+                            .ok()?
+                            .ok()?;
+                            Some(render::render_voicemeeter_gain_meter(db, &label))
                         }
-                    });
-                    match self.inner.clock_tasks.lock() {
-                        Ok(mut tasks) => tasks.push(handle),
-                        Err(poisoned) => poisoned.into_inner().push(handle),
-                    }
-                    continue;
+                    },
+                );
+            }
+            #[cfg(not(windows))]
+            SlotRender::VmMeterStub if allow_live => {
+                let img = render::render_volume_stub("NO VM");
+                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt, img).await {
+                    warn!("set_button_image vm volume stub {slot_id:?} (idx={image_idx}): {e}");
                 }
             }
-            if slot_cfg.volume_display_system {
+            SlotRender::VmInvalid(err) if allow_live => {
+                warn!("voicemeeter volume display target invalid for {slot_id:?}: {err}");
+                let img = render::solid_tile([40u8, 12u8, 12u8]);
+                let _ = self.inner.device.set_button_image(image_idx, fmt, img).await;
+            }
+            SlotRender::SysMeter if allow_live => {
                 let meter = crate::actions::system_volume::VolumeBackend::new();
                 let level0 = tokio::task::spawn_blocking({
                     let m = meter.clone();
@@ -498,96 +487,152 @@ impl AppHandle {
                 .await
                 .unwrap_or(0.0);
                 let img0 = render::render_system_volume_meter(level0);
-                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img0).await {
+                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt, img0).await {
                     warn!("set_button_image system volume {slot_id:?} (idx={image_idx}): {e}");
                 }
-                let device = self.inner.device.clone();
-                let epoch_holder = inner_for_gif.clone();
-                let meter_wake = inner_for_gif.volume_meter_wake.clone();
-                let fmt_sys = fmt.clone();
-                let handle = tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = meter_wake.notified() => {}
-                            _ = tick.tick() => {}
-                        }
-                        if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                            return;
-                        }
+                self.spawn_refresh_task(
+                    slot_id,
+                    image_idx,
+                    Duration::from_millis(100),
+                    true,
+                    this_epoch,
+                    move || {
                         let m = meter.clone();
-                        let level = match tokio::task::spawn_blocking(move || m.master_scalar().unwrap_or(0.0)).await {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let img = render::render_system_volume_meter(level);
-                        if device.set_button_image(image_idx, fmt_sys.clone(), img).await.is_err() {
-                            break;
+                        async move {
+                            let level = tokio::task::spawn_blocking(move || {
+                                m.master_scalar().unwrap_or(0.0)
+                            })
+                            .await
+                            .ok()?;
+                            Some(render::render_system_volume_meter(level))
                         }
-                        if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                            return;
-                        }
-                        let _ = device.flush().await;
-                    }
-                });
-                match self.inner.clock_tasks.lock() {
-                    Ok(mut tasks) => tasks.push(handle),
-                    Err(poisoned) => poisoned.into_inner().push(handle),
-                }
-                continue;
+                    },
+                );
             }
-            let image = choose_slot_image(slot_cfg, *states.get(&slot_id).unwrap_or(&0));
-            let Some(rel) = image else {
+            SlotRender::Static(img) => {
+                if let Some(h) = lock_sync(&self.inner.slot_tasks).remove(&slot_id) {
+                    h.abort();
+                }
+                if let Err(e) = self.inner.device.set_button_image(image_idx, fmt, img).await {
+                    warn!("set_button_image {slot_id:?} (idx={image_idx}): {e}");
+                }
+            }
+            SlotRender::Gif { frames, delays_ms } => {
+                self.spawn_gif_task(slot_id, image_idx, frames, delays_ms, this_epoch);
+            }
+            SlotRender::Clear => {
+                if let Some(h) = lock_sync(&self.inner.slot_tasks).remove(&slot_id) {
+                    h.abort();
+                }
                 let _ = self.inner.device.clear_button_image(image_idx).await;
-                continue;
-            };
-            let path = resolve_asset(&cfg, &rel);
-            match render::load_key_visual(&path) {
-                Ok(render::KeyImage::Static(img)) => {
-                    if let Err(e) = self.inner.device.set_button_image(image_idx, fmt.clone(), img).await {
-                        warn!("set_button_image {slot_id:?} (idx={image_idx}): {e}");
-                    }
-                }
-                Ok(render::KeyImage::Animated { frames, delays_ms }) => {
-                    let device = self.inner.device.clone();
-                    let gif_epoch = inner_for_gif.clone();
-                    let fmt_spawn = fmt.clone();
-                    let handle = tokio::spawn(async move {
-                        if frames.is_empty() {
-                            return;
-                        }
-                        let mut i = 0usize;
-                        loop {
-                            if gif_epoch.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let img = frames[i].clone();
-                            if device.set_button_image(image_idx, fmt_spawn.clone(), img).await.is_err() {
-                                break;
-                            }
-                            if gif_epoch.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
-                                return;
-                            }
-                            let _ = device.flush().await;
-                            let delay = delays_ms.get(i).copied().unwrap_or(100);
-                            let delay = delay.clamp(16, 10_000);
-                            tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-                            i = (i + 1) % frames.len();
-                        }
-                    });
-                    if let Ok(mut m) = self.inner.slot_gif_tasks.lock() {
-                        if let Some(old) = m.insert(slot_id, handle) {
-                            old.abort();
-                        }
-                    }
-                }
-                Err(e) => warn!("load image {}: {:#}", path.display(), e),
             }
+            // Live kinds fall here on overlay redraw (allow_live=false). Their
+            // periodic task is already running; don't touch it.
+            _ => {}
         }
-        self.inner.device.flush().await.ok();
-        Ok(())
+    }
+
+    /// Spawn a GIF playback loop for `slot_id` and record it in
+    /// [`StateInner::slot_tasks`] (aborting any prior task for the same slot).
+    fn spawn_gif_task(
+        &self,
+        slot_id: SlotId,
+        image_idx: u8,
+        frames: Vec<DynamicImage>,
+        delays_ms: Vec<u32>,
+        this_epoch: u64,
+    ) {
+        if frames.is_empty() {
+            if let Some(h) = lock_sync(&self.inner.slot_tasks).remove(&slot_id) {
+                h.abort();
+            }
+            return;
+        }
+        let device = self.inner.device.clone();
+        let epoch_holder = self.inner.clone();
+        let fmt_spawn = render::key_format();
+        let handle = tokio::spawn(async move {
+            let mut i = 0usize;
+            loop {
+                if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
+                    return;
+                }
+                let img = frames[i].clone();
+                if device
+                    .set_button_image(image_idx, fmt_spawn, img)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
+                    return;
+                }
+                let _ = device.flush().await;
+                let delay = delays_ms.get(i).copied().unwrap_or(100).clamp(16, 10_000);
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+                i = (i + 1) % frames.len();
+            }
+        });
+        if let Some(old) = lock_sync(&self.inner.slot_tasks).insert(slot_id, handle) {
+            old.abort();
+        }
+    }
+
+    /// Spawn a generic periodic-redraw task for `slot_id`.
+    ///
+    /// `produce` is invoked on each interval tick (or when
+    /// [`StateInner::volume_meter_wake`] fires when `use_volume_wake` is set);
+    /// it can return `None` to skip a frame. The first tick fires immediately,
+    /// matching the behavior of `tokio::time::interval`.
+    fn spawn_refresh_task<F, Fut>(
+        &self,
+        slot_id: SlotId,
+        image_idx: u8,
+        interval: Duration,
+        use_volume_wake: bool,
+        this_epoch: u64,
+        mut produce: F,
+    ) where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Option<DynamicImage>> + Send,
+    {
+        let device = self.inner.device.clone();
+        let epoch_holder = self.inner.clone();
+        let fmt_cloned = render::key_format();
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                if use_volume_wake {
+                    tokio::select! {
+                        biased;
+                        _ = epoch_holder.volume_meter_wake.notified() => {},
+                        _ = tick.tick() => {},
+                    }
+                } else {
+                    tick.tick().await;
+                }
+                if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
+                    return;
+                }
+                let Some(img) = produce().await else { continue };
+                if device
+                    .set_button_image(image_idx, fmt_cloned, img)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if epoch_holder.gif_display_epoch.load(Ordering::Acquire) != this_epoch {
+                    return;
+                }
+                let _ = device.flush().await;
+            }
+        });
+        if let Some(old) = lock_sync(&self.inner.slot_tasks).insert(slot_id, handle) {
+            old.abort();
+        }
     }
 
     pub async fn set_slot_state(&self, slot: SlotId, state: u8) {
@@ -625,26 +670,6 @@ impl AppHandle {
         self.render_current_page().await
     }
 
-    #[allow(dead_code)]
-    pub fn config(&self) -> Arc<Config> {
-        self.inner.config.load_full()
-    }
-
-    #[allow(dead_code)]
-    pub fn device(&self) -> Arc<Device> {
-        self.inner.device.clone()
-    }
-}
-
-fn choose_slot_image(slot: &Slot, state: u8) -> Option<String> {
-    if state >= 1 {
-        slot.image_on.clone().or_else(|| slot.image.clone())
-    } else {
-        slot.image.clone()
-    }
-}
-
-impl AppHandle {
     pub fn from_inner(inner: Arc<StateInner>) -> Self {
         Self { inner }
     }

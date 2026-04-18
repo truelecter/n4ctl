@@ -62,6 +62,17 @@ impl SlotId {
             .map(SlotId::Key)
             .chain((0..STRIP_KEYS).map(SlotId::Strip))
     }
+
+    /// Inverse of [`Self::parse`]: the `"key_3"` / `"strip_1"` / `"knob_0"` / `"swipe"`
+    /// form used as a key in `Page::slots`.
+    pub fn to_config_key(self) -> String {
+        match self {
+            SlotId::Key(n) => format!("key_{n}"),
+            SlotId::Strip(n) => format!("strip_{n}"),
+            SlotId::Knob(n) => format!("knob_{n}"),
+            SlotId::Swipe => "swipe".to_string(),
+        }
+    }
 }
 
 /// Logical input event produced by the device.
