@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <rect width="112" height="112" fill="#0f172a"/>
+  <!-- camera body -->
+  <rect x="14" y="38" width="66" height="42" rx="6" fill="#1e293b" stroke="#22d3ee" stroke-width="4"/>
+  <!-- lens cone -->
+  <path d="M80 48 L98 38 L98 80 L80 70 Z" fill="#1e293b" stroke="#22d3ee" stroke-width="4" stroke-linejoin="round"/>
+  <!-- live dot -->
+  <circle cx="30" cy="52" r="6" fill="#22c55e"/>
+  <circle cx="30" cy="52" r="10" fill="none" stroke="#22c55e" stroke-width="3" opacity="0.5"/>
+</svg>

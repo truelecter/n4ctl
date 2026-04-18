@@ -15,11 +15,15 @@ use mirajazz::{error::MirajazzError, types::DeviceInput};
 /// Total number of "buttons" mirajazz tracks internally. Must be large enough
 /// to cover every input index we emit (row 1+2 + strip = 14).
 pub const KEY_COUNT: usize = 14;
-pub const ENCODER_COUNT: usize = 4;
+/// 4 physical knobs + 1 virtual "swipe" encoder fed by strip-swipe events.
+pub const ENCODER_COUNT: usize = 5;
 
 pub const ROW_KEYS: u8 = 5;
 pub const DISPLAYED_KEYS: u8 = 2 * ROW_KEYS;
 pub const STRIP_KEYS: u8 = 4;
+
+/// Virtual encoder index used for whole-strip swipe gestures.
+pub const SWIPE_ENCODER: u8 = 4;
 
 pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
     tracing::trace!("hid input=0x{:02x} state={}", input, state);
@@ -49,6 +53,12 @@ pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
         0x91 => Ok(encoder_twist(2, 1)),
         0x70 => Ok(encoder_twist(3, -1)),
         0x71 => Ok(encoder_twist(3, 1)),
+
+        // Whole-strip swipe gestures, routed to a virtual 5th encoder. This
+        // lets users bind `on_rotate` to a logical `swipe` slot without
+        // needing a new input kind.
+        0x38 => Ok(encoder_twist(SWIPE_ENCODER, -1)),
+        0x39 => Ok(encoder_twist(SWIPE_ENCODER, 1)),
 
         0x37 | 0x00 => Ok(encoder_press(0)),
         0x35 => Ok(encoder_press(1)),

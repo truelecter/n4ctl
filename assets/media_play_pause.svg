@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <rect width="112" height="112" fill="#0f172a"/>
+  <!-- play triangle -->
+  <path d="M28 28 L28 84 L64 56 Z" fill="#a78bfa" stroke="#ede9fe" stroke-width="3" stroke-linejoin="round"/>
+  <!-- pause bars -->
+  <rect x="72" y="28" width="10" height="56" rx="2" fill="#a78bfa" stroke="#ede9fe" stroke-width="3"/>
+  <rect x="88" y="28" width="10" height="56" rx="2" fill="#a78bfa" stroke="#ede9fe" stroke-width="3"/>
+</svg>

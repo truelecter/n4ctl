@@ -1,22 +1,44 @@
 //! OBS WebSocket v5 actions.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, anyhow};
 use futures_lite::StreamExt;
 use obws::{Client, events::Event};
+use obws::requests::inputs::{InputId, Volume};
 use tracing::{info, warn};
 
 use crate::{
-    actions::{ActionContext, str_field},
+    actions::{ActionContext, f32_field, str_field},
     config::ActionSpec,
     mapping::SlotId,
     state::AppHandle,
 };
+
+/// How long after a failed connect attempt we skip further connects so that
+/// rapid button presses while OBS is offline don't queue up 2s timeouts.
+const OBS_CONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Hard cap on a single `Client::connect` call so it can't freeze a dispatch
+/// task for too long even if DNS / TCP stalls.
+const OBS_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct ObsClient {
     pub client: Client,
 }
 
 async fn ensure(ctx: &ActionContext) -> Result<()> {
+    // Fast path: already connected.
+    if ctx.obs.lock().await.is_some() {
+        return Ok(());
+    }
+    // Cooldown: bail early if a recent connect failed.
+    if let Some(t) = *ctx.obs_backoff.lock().await {
+        if t.elapsed() < OBS_CONNECT_BACKOFF {
+            return Err(anyhow!("OBS connect in backoff"));
+        }
+    }
+
     let mut guard = ctx.obs.lock().await;
     if guard.is_some() {
         return Ok(());
@@ -32,9 +54,19 @@ async fn ensure(ctx: &ActionContext) -> Result<()> {
         .clone()
         .or_else(|| o.password_env.as_ref().and_then(|k| std::env::var(k).ok()));
 
-    let client = Client::connect(host, port, password)
-        .await
-        .context("connect OBS")?;
+    let connect = Client::connect(host, port, password);
+    let client = match tokio::time::timeout(OBS_CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            *ctx.obs_backoff.lock().await = Some(Instant::now());
+            return Err(anyhow::Error::new(e).context("connect OBS"));
+        }
+        Err(_) => {
+            *ctx.obs_backoff.lock().await = Some(Instant::now());
+            return Err(anyhow!("OBS connect timed out after {OBS_CONNECT_TIMEOUT:?}"));
+        }
+    };
+    *ctx.obs_backoff.lock().await = None;
     info!("Connected to OBS WebSocket");
 
     // Prime scene + virtual cam state
@@ -115,6 +147,28 @@ pub async fn scene(ctx: &ActionContext, spec: &ActionSpec) -> Result<()> {
         .set_current_program_scene(scene.as_str())
         .await
         .with_context(|| format!("SetCurrentProgramScene({scene})"))?;
+    Ok(())
+}
+
+/// Adjust an OBS input's mixer volume **in dB** relative to its current level
+/// (`GetInputVolume`, apply `step_db` × encoder ticks, `SetInputVolume` as dB).
+pub async fn input_volume(ctx: &ActionContext, spec: &ActionSpec, rotation: Option<i32>) -> Result<()> {
+    ensure(ctx).await?;
+    let input = str_field(spec, "input")?;
+    let step_db = f32_field(spec, "step_db", 1.0);
+    let ticks = rotation.unwrap_or(1) as f32;
+
+    let guard = ctx.obs.lock().await;
+    let client = &guard.as_ref().context("obs client gone")?.client;
+    let id = InputId::Name(input);
+    let vol = client.inputs().volume(id).await.context("GetInputVolume")?;
+    // OBS mixer is effectively bounded; clamp avoids rejected RPC on edge values.
+    let next_db = (vol.db + step_db * ticks).clamp(-100.0, 30.0);
+    client
+        .inputs()
+        .set_volume(id, Volume::Db(next_db))
+        .await
+        .context("SetInputVolume")?;
     Ok(())
 }
 

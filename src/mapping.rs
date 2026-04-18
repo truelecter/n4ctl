@@ -1,9 +1,12 @@
 //! Translation between the mirajazz DeviceStateUpdate and logical slot ids.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use mirajazz::state::DeviceStateUpdate;
 use serde::{Deserialize, Serialize};
 
-use crate::inputs::{DISPLAYED_KEYS, ROW_KEYS, STRIP_KEYS};
+use crate::inputs::{DISPLAYED_KEYS, ROW_KEYS, STRIP_KEYS, SWIPE_ENCODER};
 
 /// Logical slot referring to a physical control on the N4.
 ///
@@ -11,16 +14,21 @@ use crate::inputs::{DISPLAYED_KEYS, ROW_KEYS, STRIP_KEYS};
 /// * `Key(5..=9)`  -> row 2 (lower), keys 2.1..2.5.
 /// * `Strip(0..=3)` -> sensor-strip zones 3.1..3.4.
 /// * `Knob(0..=3)` -> rotary encoders 4.1..4.4.
+/// * `Swipe`        -> whole-strip swipe gesture (emits rotate events only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "index")]
 pub enum SlotId {
     Key(u8),
     Strip(u8),
     Knob(u8),
+    Swipe,
 }
 
 impl SlotId {
     pub fn parse(s: &str) -> Option<Self> {
+        if s == "swipe" {
+            return Some(SlotId::Swipe);
+        }
         let (prefix, num) = s.split_once('_')?;
         let n: u8 = num.parse().ok()?;
         match prefix {
@@ -43,7 +51,7 @@ impl SlotId {
             SlotId::Key(n) if n < ROW_KEYS => Some(10 + n),
             SlotId::Key(n) if n < DISPLAYED_KEYS => Some(n),
             SlotId::Strip(n) if n < STRIP_KEYS => Some(n),
-            _ => None,
+            SlotId::Knob(_) | SlotId::Swipe | SlotId::Key(_) | SlotId::Strip(_) => None,
         }
     }
 
@@ -68,8 +76,21 @@ pub enum InputEvent {
 pub fn update_to_slot(u: &DeviceStateUpdate) -> Option<SlotId> {
     match *u {
         DeviceStateUpdate::ButtonDown(n) | DeviceStateUpdate::ButtonUp(n) => raw_button_slot(n),
-        DeviceStateUpdate::EncoderDown(n) | DeviceStateUpdate::EncoderUp(n) => Some(SlotId::Knob(n)),
-        DeviceStateUpdate::EncoderTwist(n, _) => Some(SlotId::Knob(n)),
+        DeviceStateUpdate::EncoderDown(n) | DeviceStateUpdate::EncoderUp(n) => {
+            if n == SWIPE_ENCODER {
+                // Swipes never produce press/release - suppress noise.
+                None
+            } else {
+                Some(SlotId::Knob(n))
+            }
+        }
+        DeviceStateUpdate::EncoderTwist(n, _) => {
+            if n == SWIPE_ENCODER {
+                Some(SlotId::Swipe)
+            } else {
+                Some(SlotId::Knob(n))
+            }
+        }
     }
 }
 
@@ -107,4 +128,66 @@ pub fn expand_update(u: &DeviceStateUpdate) -> Vec<InputEvent> {
         (SlotId::Strip(_), DeviceStateUpdate::ButtonUp(_)) => Vec::new(),
         _ => vec![update_to_event(u, slot)],
     }
+}
+
+#[derive(Default)]
+struct RotateAcc {
+    /// Slots in first-seen order (one entry per slot when it first appears).
+    order: Vec<SlotId>,
+    sums: HashMap<SlotId, i32>,
+}
+
+impl RotateAcc {
+    fn add(&mut self, slot: SlotId, d: i8) {
+        match self.sums.entry(slot) {
+            Entry::Occupied(mut e) => {
+                *e.get_mut() += d as i32;
+            }
+            Entry::Vacant(e) => {
+                self.order.push(slot);
+                e.insert(d as i32);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        let order = std::mem::take(&mut self.order);
+        for slot in order {
+            let Some(mut sum) = self.sums.remove(&slot) else {
+                continue;
+            };
+            if sum == 0 {
+                continue;
+            }
+            // N4 quirk: the first physical detent often arrives as six ±1 HID steps
+            // (±6 total). Treat that as a single click so relative gain/volume steps
+            // match the hardware.
+            if sum.abs() == 6 {
+                sum = sum.signum();
+            }
+            let v = sum.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            out.push(InputEvent::Rotate(slot, v));
+        }
+        self.sums.clear();
+        out
+    }
+}
+
+/// Merge `Rotate` deltas for the same slot between non-rotate events, and collapse
+/// spurious ±6 totals (see [`RotateAcc::flush`]).
+pub fn coalesce_rotate_batch(events: Vec<InputEvent>) -> Vec<InputEvent> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut acc = RotateAcc::default();
+    for ev in events {
+        match ev {
+            InputEvent::Rotate(s, d) => acc.add(s, d),
+            other => {
+                out.extend(acc.flush());
+                out.push(other);
+            }
+        }
+    }
+    out.extend(acc.flush());
+    out
 }

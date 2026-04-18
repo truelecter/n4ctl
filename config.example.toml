@@ -5,6 +5,28 @@
 #   key_5 .. key_9     - row 2 (lower), keys 2.1 .. 2.5
 #   strip_0 .. strip_3 - sensor strip, zones 3.1 .. 3.4 (4 zones, with LEDs)
 #   knob_0 .. knob_3   - rotary encoders 4.1 .. 4.4
+#   swipe              - whole-strip swipe gesture (on_rotate only; negative
+#                        value = swipe left, positive value = swipe right)
+#
+# Image paths are resolved relative to the config file. PNG, JPEG, BMP, GIF
+# (animated GIFs are supported) and SVG (including .svgz) are all supported;
+# SVGs are rasterised to 112x112
+# on load so they stay crisp regardless of source resolution. A small
+# library of ready-to-use icons ships in the `assets/` folder.
+#
+# `clock = true` on a key/strip slot draws a live local-time `HH:MM` readout
+# (updated every second) instead of a static `image`.
+#
+# `volume_display_system = true` shows the default playback device level (bar + %),
+# polled ~10×/s and refresh immediately when you turn a volume encoder (Windows).
+#
+# `volume_display_voicemeeter = { target = "Strip", index = 0 }` (or `target = "Bus"`)
+# shows that strip/bus Gain in dB as a bar (~10×/s + wake on `voicemeeter.gain`; Windows + VM).
+# If both `volume_display_*` are set on the same slot, Voicemeeter wins over system.
+#
+# `obs.input_volume` (alias `obs.volume`): relative dB steps — set `input` to the
+# OBS source name and `step_db` (e.g. 0.5 or 1.0) per encoder tick; reads current
+# level then adds `step_db` × rotation (do not use an absolute mul slider in OBS).
 
 [device]
 brightness = 60                 # 0..100
@@ -23,16 +45,16 @@ name = "main"
 default = true
 
 [pages.slots.key_0]
-image = "assets/obs_game.png"
+image = "assets/obs_game.svg"
 on_press = { action = "obs.scene", scene = "Game" }
 
 [pages.slots.key_1]
-image = "assets/obs_vcam_off.png"
-image_on = "assets/obs_vcam_on.png"
+image = "assets/obs_vcam_off.svg"
+image_on = "assets/obs_vcam_on.svg"
 on_press = { action = "obs.virtual_cam" }
 
 [pages.slots.key_9]
-image = "assets/next_page.png"
+image = "assets/next_page.svg"
 on_press = { action = "page.next" }
 
 [pages.slots.knob_0]
@@ -43,10 +65,27 @@ on_press  = { action = "voicemeeter.mute", target = "Strip", index = 0 }
 [pages.slots.knob_1]
 # Rotate for system output volume (2% per tick)
 on_rotate = { action = "system.volume", step = 2 }
+# Or OBS mixer for a named source (relative dB per tick):
+# on_rotate = { action = "obs.input_volume", input = "Desktop Audio", step_db = 0.5 }
+
+[pages.slots.key_2]
+# Live meters (no `image` needed for these widget slots)
+volume_display_system = true
+
+[pages.slots.key_3]
+volume_display_voicemeeter = { target = "Strip", index = 0 }
 
 [pages.slots.strip_0]
 # Push-to-mute binding that Discord listens for
+image = "assets/mic_off.svg"
+image_on = "assets/mic_on.svg"
 on_press = { action = "hotkey", keys = ["Ctrl", "Shift", "M"] }
+
+[pages.slots.swipe]
+# Swipe left/right across the whole sensor strip: negative rotation = left,
+# positive = right. `page.cycle` uses the rotation sign, so swiping left
+# goes to the previous page and swiping right to the next.
+on_rotate = { action = "page.cycle" }
 
 # --- Second page ------------------------------------------------------------
 
@@ -54,8 +93,17 @@ on_press = { action = "hotkey", keys = ["Ctrl", "Shift", "M"] }
 name = "media"
 
 [pages.slots.key_0]
+image = "assets/media_play_pause.svg"
 on_press = { action = "hotkey", keys = ["MediaPlayPause"] }
 
+[pages.slots.key_1]
+image = "assets/media_prev.svg"
+on_press = { action = "hotkey", keys = ["MediaPrevTrack"] }
+
+[pages.slots.key_2]
+image = "assets/media_next.svg"
+on_press = { action = "hotkey", keys = ["MediaNextTrack"] }
+
 [pages.slots.key_9]
-image = "assets/prev_page.png"
+image = "assets/prev_page.svg"
 on_press = { action = "page.prev" }

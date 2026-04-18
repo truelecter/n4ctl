@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <rect width="112" height="112" fill="#0f172a"/>
+  <!-- capsule -->
+  <rect x="44" y="18" width="24" height="48" rx="12" fill="#22c55e" stroke="#dcfce7" stroke-width="3"/>
+  <!-- stand arc -->
+  <path d="M30 58 C30 80 50 92 56 92 C62 92 82 80 82 58"
+        fill="none" stroke="#22c55e" stroke-width="6" stroke-linecap="round"/>
+  <!-- base -->
+  <line x1="56" y1="92" x2="56" y2="100" stroke="#22c55e" stroke-width="6" stroke-linecap="round"/>
+  <line x1="42" y1="100" x2="70" y2="100" stroke="#22c55e" stroke-width="6" stroke-linecap="round"/>
+</svg>

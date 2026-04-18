@@ -62,11 +62,29 @@ pub struct Page {
     pub slots: BTreeMap<String, Slot>,
 }
 
+/// Voicemeeter strip/bus to show on a key as a live gain meter (`-60..12` dB bar).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicemeeterVolumeDisplay {
+    pub target: String,
+    pub index: u32,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Slot {
     pub image: Option<String>,
     pub image_on: Option<String>,
+    /// When true, the key shows a live local-time readout (updated every second)
+    /// instead of loading `image` / `image_on` from disk.
+    #[serde(default)]
+    pub clock: bool,
+    /// Live default playback device level (0–100%) on this key; polled ~10×/s, instant wake on encoder.
+    #[serde(default)]
+    pub volume_display_system: bool,
+    /// Live Voicemeeter `Gain` for this strip/bus; polled ~10×/s, instant wake on encoder (Windows only).
+    #[serde(default)]
+    pub volume_display_voicemeeter: Option<VoicemeeterVolumeDisplay>,
     pub on_press: Option<ActionSpec>,
     pub on_release: Option<ActionSpec>,
     pub on_rotate: Option<ActionSpec>,
@@ -104,6 +122,7 @@ fn validate(cfg: &Config) -> Result<()> {
 }
 
 pub fn resolve_asset(cfg: &Config, rel: &str) -> PathBuf {
+    let rel = rel.trim();
     let p = Path::new(rel);
     if p.is_absolute() {
         p.to_path_buf()

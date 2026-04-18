@@ -54,12 +54,31 @@ Then one or more `[[pages]]` tables. The first page (or the one with `default = 
 - `key_5 .. key_9` — row 2 (lower, displayed)
 - `strip_0 .. strip_3` — sensor strip (4 zones, backlit tiles)
 - `knob_0 .. knob_3` — rotary encoders (no image)
+- `swipe` — whole-strip swipe gesture (only fires `on_rotate`; the rotation value is `-1` for a left swipe and `+1` for a right swipe)
 
 Each slot can define:
 
-- `image` — PNG/JPG path (resolved relative to the config file, or `[device].assets_root`)
+- `image` — PNG, JPEG, BMP, **GIF** (animated GIFs cycle on the key), or SVG path (resolved relative to the config file, or `[device].assets_root`). SVGs are rasterised to 112×112 on load and are the recommended format — they stay sharp and are trivial to recolour in a text editor.
 - `image_on` — alternate image for the "active" state (2-state icons)
 - `on_press`, `on_release`, `on_rotate` — action tables (see below)
+
+### Bundled assets
+
+`n4ctl` ships a small SVG icon set in `assets/` for common bindings. They are intentionally flat, high-contrast and tuned for the 112×112 key size:
+
+| file | usage |
+| --- | --- |
+| `next_page.svg` / `prev_page.svg` | `page.next` / `page.prev` |
+| `obs_scene.svg` / `obs_game.svg` | `obs.scene` |
+| `obs_vcam_on.svg` / `obs_vcam_off.svg` | `obs.virtual_cam` (`image_on` / `image`) |
+| `mic_on.svg` / `mic_off.svg` | mute toggles (Voicemeeter, push-to-talk) |
+| `volume.svg` / `volume_mute.svg` | `system.volume`, speaker mute |
+| `media_play_pause.svg` / `media_next.svg` / `media_prev.svg` | media hotkeys |
+| `record_on.svg` / `record_off.svg` | OBS recording state |
+| `discord.svg` | Discord push-to-mute |
+| `blank.svg` | deliberately empty (dark) tile |
+
+Swap colours by opening the SVG in any editor — e.g. `fill="#22c55e"` on `mic_on.svg`. Changes are picked up on the next hot reload.
 
 ### Built-in actions
 
@@ -72,6 +91,7 @@ Each slot can define:
 | `voicemeeter.gain` | `target = "Strip" \| "Bus"`, `index`, `step` (dB/tick), optional `min`/`max` | |
 | `voicemeeter.mute` | `target`, `index` | Polled every ~400ms so the icon reflects Voicemeeter's real state. |
 | `page.next` / `page.prev` | — | Cycle through `[[pages]]`. |
+| `page.cycle` | — | Cycle pages; on `on_rotate` bindings (knobs or `swipe`) it honors the rotation sign. |
 | `page.goto` | `page` (name) | Jump to a named page. |
 
 Any slot key can be omitted; keys without an `image` just stay blank.

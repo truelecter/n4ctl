@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <rect width="112" height="112" fill="#0f172a"/>
+  <!-- camera body (dimmed) -->
+  <rect x="14" y="38" width="66" height="42" rx="6" fill="#1e293b" stroke="#475569" stroke-width="4"/>
+  <path d="M80 48 L98 38 L98 80 L80 70 Z" fill="#1e293b" stroke="#475569" stroke-width="4" stroke-linejoin="round"/>
+  <!-- red slash -->
+  <line x1="18" y1="18" x2="100" y2="100" stroke="#0f172a" stroke-width="14" stroke-linecap="round"/>
+  <line x1="18" y1="18" x2="100" y2="100" stroke="#ef4444" stroke-width="8" stroke-linecap="round"/>
+</svg>

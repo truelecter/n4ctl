@@ -205,10 +205,12 @@ async fn run_session(config_path: &std::path::Path) -> Result<()> {
             match reader.read(Some(std::time::Duration::from_millis(200))).await {
                 Ok(updates) => {
                     consecutive = 0;
+                    let mut batch = Vec::new();
                     for u in updates {
-                        for event in mapping::expand_update(&u) {
-                            let _ = evt_tx.send(event);
-                        }
+                        batch.extend(mapping::expand_update(&u));
+                    }
+                    for event in mapping::coalesce_rotate_batch(batch) {
+                        let _ = evt_tx.send(event);
                     }
                 }
                 Err(e) => {
@@ -254,6 +256,7 @@ async fn run_session(config_path: &std::path::Path) -> Result<()> {
         }
     };
 
+    app.clone_handle().shutdown_gif_tasks().await;
     input_task.abort();
     watcher_task.abort();
     keepalive_task.abort();
