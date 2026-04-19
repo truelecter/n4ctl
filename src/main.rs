@@ -4,22 +4,24 @@ mod config;
 mod device;
 mod inputs;
 mod mapping;
+mod power_session;
 mod render;
+mod service;
 mod state;
 mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::cli::{Cli, Command};
 use crate::state::AppState;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,n4ctl=debug".into()))
         .with_target(false)
@@ -27,13 +29,86 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Command::Run) {
-        Command::List => list_devices().await,
-        Command::Map => run_map_mode().await,
-        Command::Raw => run_raw_mode().await,
-        Command::Probe { max, dwell_ms } => run_probe_mode(max, dwell_ms).await,
-        Command::Run => run_main(cli.config).await,
+    // Install / uninstall / service dispatch are synchronous and must NOT
+    // spin up a tokio runtime at the top level: `service_dispatcher::start`
+    // blocks the calling thread and is expected to own the process.
+    match cli.command.clone() {
+        Some(Command::Install {
+            mechanism,
+            name,
+            display_name,
+            force,
+            user,
+            password,
+            manual,
+        }) => {
+            return service::install(service::InstallOptions {
+                mechanism,
+                name,
+                display_name,
+                force,
+                user,
+                password,
+                auto_start: !manual,
+                config: cli.config,
+            });
+        }
+        Some(Command::Uninstall { mechanism, name }) => {
+            return service::uninstall(mechanism, &name);
+        }
+        Some(Command::Service { name }) => {
+            return service::run_service(name, cli.config);
+        }
+        _ => {}
     }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    rt.block_on(async move {
+        match cli.command.unwrap_or(Command::Run) {
+            Command::List => list_devices().await,
+            Command::Map => run_map_mode().await,
+            Command::Raw => run_raw_mode().await,
+            Command::Probe { max, dwell_ms } => run_probe_mode(max, dwell_ms).await,
+            Command::Run => {
+                let config_path = resolve_config_path(cli.config);
+                run_main(config_path, CancellationToken::new()).await
+            }
+            // Handled synchronously above.
+            Command::Install { .. } | Command::Uninstall { .. } | Command::Service { .. } => {
+                unreachable!()
+            }
+        }
+    })
+}
+
+/// Search order for the controller config, consulted only when the user did
+/// not pass `--config`:
+///   1. `$PWD/config.toml`
+///   2. `~/n4ctl.toml`
+///
+/// Falls back to `$PWD/config.toml` (existence-unchecked) so the first
+/// `config::load` call surfaces a clear "file not found" error.
+pub fn resolve_config_path(cli_override: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = cli_override {
+        return p;
+    }
+    let candidates = [
+        std::env::current_dir().ok().map(|p| p.join("config.toml")),
+        dirs::home_dir().map(|p| p.join("n4ctl.toml")),
+    ];
+    for c in candidates.iter().flatten() {
+        if c.is_file() {
+            return c.clone();
+        }
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("config.toml"))
 }
 
 /// Apply brightness and start from a blank state; shared by `run_session`,
@@ -75,7 +150,7 @@ async fn run_probe_mode(max: u8, dwell_ms: u64) -> Result<()> {
 
     for idx in 0..max {
         info!("now painting image_idx={idx} -- which physical position lit up?");
-        let _ = dev.set_button_image(idx, fmt.clone(), bright.clone()).await;
+        let _ = dev.set_button_image(idx, fmt, bright.clone()).await;
         let _ = dev.flush().await;
         tokio::time::sleep(std::time::Duration::from_millis(dwell_ms)).await;
         // Clear just this index (0xff would clear everything).
@@ -145,7 +220,7 @@ async fn run_map_mode() -> Result<()> {
                     };
                     if let (Some(s), Some(img)) = (slot, img) {
                         if let Some(idx) = s.image_index() {
-                            let _ = dev.set_button_image(idx, fmt.clone(), img).await;
+                            let _ = dev.set_button_image(idx, fmt, img).await;
                             let _ = dev.flush().await;
                         }
                     }
@@ -159,25 +234,28 @@ async fn run_map_mode() -> Result<()> {
     }
 }
 
-async fn run_main(config_path: Option<PathBuf>) -> Result<()> {
-    let config_path = config_path
-        .or_else(|| std::env::current_dir().ok().map(|p| p.join("config.toml")))
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
-
+pub async fn run_main(config_path: PathBuf, shutdown: CancellationToken) -> Result<()> {
     loop {
-        match run_session(&config_path).await {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        match run_session(&config_path, &shutdown).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 warn!("session ended: {e:?}; reconnecting in 2s");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
             }
         }
     }
 }
 
 /// One "session" = open device, render, run event loop. Returns on fatal
-/// device/read error so the outer loop can reconnect.
-async fn run_session(config_path: &std::path::Path) -> Result<()> {
+/// device/read error so the outer loop can reconnect, or cleanly when
+/// `shutdown` is cancelled (service Stop, Ctrl-C wiring, …).
+async fn run_session(config_path: &Path, shutdown: &CancellationToken) -> Result<()> {
     info!("Loading config from {}", config_path.display());
     let cfg = config::load(config_path).with_context(|| format!("load config {}", config_path.display()))?;
 
@@ -248,6 +326,46 @@ async fn run_session(config_path: &std::path::Path) -> Result<()> {
         })
     };
 
+    #[cfg(windows)]
+    let (power_tx, mut power_rx) = mpsc::unbounded_channel::<power_session::PowerSessionEvent>();
+    #[cfg(windows)]
+    let power_watcher = power_session::spawn_watcher(power_tx);
+    #[cfg(windows)]
+    let power_listener = {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let handle = app.clone_handle();
+        let dev_pw = app.device_arc();
+        let asleep = std::sync::Arc::new(AtomicBool::new(false));
+        // `asleep` collapses overlapping off/on events (e.g. suspend + lock
+        // arriving back-to-back) so we don't double-sleep / double-restore.
+        tokio::spawn(async move {
+            while let Some(ev) = power_rx.recv().await {
+                match ev {
+                    power_session::PowerSessionEvent::DisplayOff => {
+                        if !asleep.swap(true, Ordering::SeqCst) {
+                            if let Err(e) = dev_pw.sleep().await {
+                                warn!("device screen off (sleep/lock/shutdown): {e}");
+                            } else {
+                                info!("device screen off (sleep, shutdown, or session lock)");
+                            }
+                        }
+                    }
+                    power_session::PowerSessionEvent::DisplayOn => {
+                        if asleep.swap(false, Ordering::SeqCst) {
+                            let b = handle.configured_brightness();
+                            dev_pw.set_brightness(b).await.ok();
+                            dev_pw.keep_alive().await.ok();
+                            match handle.render_current_page().await {
+                                Ok(()) => info!("device display restored after resume or login"),
+                                Err(e) => warn!("restore device display: {e}"),
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let dispatch = app.run_dispatch_loop(evt_rx);
     tokio::pin!(dispatch);
 
@@ -257,7 +375,15 @@ async fn run_session(config_path: &std::path::Path) -> Result<()> {
             let reason = reason.unwrap_or_else(|_| "input task ended".into());
             Err(anyhow::anyhow!("device failure: {reason}"))
         }
+        _ = shutdown.cancelled() => Ok(()),
     };
+
+    #[cfg(windows)]
+    {
+        power_watcher.request_shutdown();
+        let _ = tokio::task::spawn_blocking(move || power_watcher.join()).await;
+        power_listener.abort();
+    }
 
     app.clone_handle().shutdown_gif_tasks().await;
     input_task.abort();

@@ -4,4 +4,3 @@
 *.log
 .env
 /assets-local
-Cargo.lock

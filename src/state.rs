@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -232,6 +232,22 @@ enum SlotRender {
     Clear,
 }
 
+#[cfg(debug_assertions)]
+fn slot_render_name(kind: &SlotRender) -> &'static str {
+    match kind {
+        SlotRender::Clock => "Clock",
+        SlotRender::SysMeter => "SysMeter",
+        #[cfg(windows)]
+        SlotRender::VmMeter { .. } => "VmMeter",
+        #[cfg(not(windows))]
+        SlotRender::VmMeterStub => "VmMeterStub",
+        SlotRender::VmInvalid(_) => "VmInvalid",
+        SlotRender::Static(_) => "Static",
+        SlotRender::Gif { .. } => "Gif",
+        SlotRender::Clear => "Clear",
+    }
+}
+
 #[cfg_attr(not(windows), allow(unused_variables))]
 fn classify_slot(cfg: &Config, slot_cfg: &Slot, state: u8) -> SlotRender {
     if slot_cfg.clock {
@@ -281,6 +297,10 @@ fn classify_slot(cfg: &Config, slot_cfg: &Slot, state: u8) -> SlotRender {
 }
 
 impl AppHandle {
+    pub fn configured_brightness(&self) -> u8 {
+        self.inner.config.load_full().device.brightness.unwrap_or(60)
+    }
+
     pub(crate) fn action_context(&self) -> Option<Arc<ActionContext>> {
         let guard = self.inner.action_ctx.lock().ok()?;
         guard.as_ref()?.upgrade()
@@ -526,8 +546,26 @@ impl AppHandle {
                 }
                 let _ = self.inner.device.clear_button_image(image_idx).await;
             }
-            // Live kinds fall here on overlay redraw (allow_live=false). Their
-            // periodic task is already running; don't touch it.
+            // Live kinds reach here only on overlay redraw (allow_live=false).
+            // Their periodic task is already running; don't touch it. Today
+            // only `sync_slot_kind` triggers overlay redraws, and it targets
+            // action-bound slots (obs.scene / obs.virtual_cam / voicemeeter.mute)
+            // that are never live. If that contract ever changes, the old
+            // live task will keep running and overwrite the new art until the
+            // next full re-render — log so it's noticed.
+            #[cfg(debug_assertions)]
+            other => {
+                debug_assert!(
+                    !allow_live,
+                    "unreachable paint_slot branch on full redraw: kind={}",
+                    slot_render_name(&other)
+                );
+                warn!(
+                    "overlay redraw hit live-kind slot {slot_id:?} ({}); leaving running task intact",
+                    slot_render_name(&other)
+                );
+            }
+            #[cfg(not(debug_assertions))]
             _ => {}
         }
     }
@@ -550,7 +588,7 @@ impl AppHandle {
         }
         let device = self.inner.device.clone();
         let epoch_holder = self.inner.clone();
-        let fmt_spawn = render::key_format();
+        let fmt = render::key_format();
         let handle = tokio::spawn(async move {
             let mut i = 0usize;
             loop {
@@ -559,7 +597,7 @@ impl AppHandle {
                 }
                 let img = frames[i].clone();
                 if device
-                    .set_button_image(image_idx, fmt_spawn, img)
+                    .set_button_image(image_idx, fmt, img)
                     .await
                     .is_err()
                 {
@@ -583,8 +621,10 @@ impl AppHandle {
     ///
     /// `produce` is invoked on each interval tick (or when
     /// [`StateInner::volume_meter_wake`] fires when `use_volume_wake` is set);
-    /// it can return `None` to skip a frame. The first tick fires immediately,
-    /// matching the behavior of `tokio::time::interval`.
+    /// it can return `None` to skip a frame. The first tick fires after
+    /// `interval` has elapsed — callers paint the initial frame synchronously
+    /// before spawning this task, so firing immediately would just re-push
+    /// the same bytes.
     fn spawn_refresh_task<F, Fut>(
         &self,
         slot_id: SlotId,
@@ -599,9 +639,9 @@ impl AppHandle {
     {
         let device = self.inner.device.clone();
         let epoch_holder = self.inner.clone();
-        let fmt_cloned = render::key_format();
+        let fmt = render::key_format();
         let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
+            let mut tick = tokio::time::interval_at(Instant::now() + interval, interval);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 if use_volume_wake {
@@ -618,7 +658,7 @@ impl AppHandle {
                 }
                 let Some(img) = produce().await else { continue };
                 if device
-                    .set_button_image(image_idx, fmt_cloned, img)
+                    .set_button_image(image_idx, fmt, img)
                     .await
                     .is_err()
                 {
@@ -779,7 +819,7 @@ impl AppHandle {
         let Some(page) = cfg.pages.iter().find(|p| p.name == page_name) else {
             return out;
         };
-        for (_key, slot) in &page.slots {
+        for slot in page.slots.values() {
             let Some(spec) = slot.on_press.as_ref() else { continue };
             if spec.get("action").and_then(|v| v.as_str()) != Some("voicemeeter.mute") {
                 continue;

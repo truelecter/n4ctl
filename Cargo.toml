@@ -10,9 +10,18 @@ publish = false
 name = "n4ctl"
 path = "src/main.rs"
 
+# Tiny GUI-subsystem (`windows_subsystem = "windows"`) stub that spawns
+# `n4ctl.exe` with `CREATE_NO_WINDOW` and waits on it. `install --mechanism
+# task` points the Scheduled Task at this binary so auto-starts don't flash
+# a console window. Has no effect / is a stub on non-Windows targets.
+[[bin]]
+name = "n4ctl-launcher"
+path = "src/bin/launcher.rs"
+
 [dependencies]
 mirajazz = "0.13"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 futures-lite = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -33,6 +42,7 @@ font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
 
 [target.'cfg(windows)'.dependencies]
 voicemeeter = "0.4"
+windows-service = "0.7"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -41,6 +51,11 @@ windows = { version = "0.58", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Variant",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_LibraryLoader",
 ] }
 
 [profile.release]
