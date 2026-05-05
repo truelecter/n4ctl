@@ -17,14 +17,34 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::prelude::*;
 
 use crate::cli::{Cli, Command};
 use crate::state::AppState;
 
 fn main() -> Result<()> {
-    fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,n4ctl=debug".into()))
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".n4ctl")
+        .join("logs");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "n4ctl.log");
+    let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,n4ctl=debug".into());
+
+    let console_layer = fmt::layer().with_target(false);
+    let file_layer = fmt::layer()
         .with_target(false)
+        .with_ansi(false)
+        .with_writer(file_writer);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(console_layer)
+        .with(file_layer)
         .init();
 
     let cli = Cli::parse();
@@ -352,6 +372,17 @@ async fn run_session(config_path: &Path, shutdown: &CancellationToken) -> Result
                     }
                     power_session::PowerSessionEvent::DisplayOn => {
                         if asleep.swap(false, Ordering::SeqCst) {
+                            // Re-enable the device's HID input-report stream
+                            // BEFORE anything else. mirajazz::Device::sleep
+                            // halts input reporting at the firmware level
+                            // and its one-shot `initialize()` gate prevents
+                            // subsequent calls from re-sending the wake
+                            // packet. Without this, displays/meters refresh
+                            // fine but button/knob events never reach the
+                            // host. See `device::wake` for details.
+                            if let Err(e) = device::wake(&dev_pw).await {
+                                warn!("wake device input stream: {e:#}");
+                            }
                             let b = handle.configured_brightness();
                             dev_pw.set_brightness(b).await.ok();
                             dev_pw.keep_alive().await.ok();

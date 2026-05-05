@@ -85,6 +85,7 @@ async fn ensure(ctx: &ActionContext) -> Result<()> {
     match client.events() {
         Ok(stream) => {
             let inner = ctx.state.clone();
+            let obs_slot = ctx.obs.clone();
             tokio::spawn(async move {
                 let handle = AppHandle::from_inner(inner);
                 tokio::pin!(stream);
@@ -100,6 +101,8 @@ async fn ensure(ctx: &ActionContext) -> Result<()> {
                     }
                 }
                 warn!("OBS event stream closed");
+                // Drop the cached client so the next OBS action re-connects.
+                *obs_slot.lock().await = None;
             });
         }
         Err(e) => warn!("could not subscribe to OBS events: {e}"),

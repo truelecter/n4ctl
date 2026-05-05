@@ -47,7 +47,7 @@ pub struct Dispatch {
 /// hit in parallel (OBS client, Voicemeeter DLL, hotkey sender).
 pub struct ActionContext {
     pub state: Arc<StateInner>,
-    pub obs: Mutex<Option<obs::ObsClient>>,
+    pub obs: Arc<Mutex<Option<obs::ObsClient>>>,
     /// Instant of the last failed OBS connection attempt. Used to short-circuit
     /// repeated connect tries so rapid button presses while OBS is offline
     /// don't pile up 2-second timeouts on background tasks.
@@ -65,7 +65,7 @@ impl ActionContext {
     pub async fn new(state: Arc<StateInner>) -> Self {
         Self {
             state,
-            obs: Mutex::new(None),
+            obs: Arc::new(Mutex::new(None)),
             obs_backoff: Mutex::new(None),
             #[cfg(windows)]
             vm: std::sync::Arc::new(std::sync::Mutex::new(None)),

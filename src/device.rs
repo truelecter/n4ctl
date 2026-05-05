@@ -63,6 +63,31 @@ pub async fn find_connected() -> Result<Vec<Found>> {
     Ok(out)
 }
 
+/// Wake the device after a previous [`Device::sleep`] call.
+///
+/// Background: `mirajazz::Device::sleep` sends the `HAN` packet which puts
+/// the firmware into a low-power mode where the HID input-report stream is
+/// halted. The firmware needs the `DIS` init packet to resume streaming
+/// button / encoder / strip events. Unfortunately `Device::initialize` is
+/// gated on a one-shot `AtomicBool`, so all the usual "just call something"
+/// helpers (`set_brightness`, `keep_alive`, …) short-circuit after the
+/// first init and never re-send `DIS`. Result: displays still update on
+/// resume (those writes don't need `DIS`), but inputs stay silent.
+///
+/// We fix that by sending the `DIS` packet ourselves via the public
+/// `write_extended_data`, which *does* bypass the init gate. This is the
+/// exact first byte sequence that `Device::initialize` uses internally
+/// (see mirajazz `src/device.rs::initialize`).
+pub async fn wake(dev: &Device) -> Result<()> {
+    // `0x43 0x52 0x54` = "CRT" (protocol tag), then `0x44 0x49 0x53` = "DIS"
+    // — the firmware's "display-input-stream" enable command.
+    let mut dis = vec![0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x44, 0x49, 0x53];
+    dev.write_extended_data(&mut dis)
+        .await
+        .context("writing DIS wake packet")?;
+    Ok(())
+}
+
 /// Opens the first matching device. Protocol v3 is assumed for N4-family.
 pub async fn open_first() -> Result<Device> {
     let mut found = find_connected().await?;
