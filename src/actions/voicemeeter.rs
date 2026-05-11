@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(windows)]
+use tracing::debug;
+
+#[cfg(windows)]
 use crate::util::lock_sync;
 
 /// Typed Voicemeeter target: a strip or a bus at a given index.
@@ -129,6 +132,18 @@ fn format_script_float(v: f32) -> String {
 /// a flag that's `true` if this call is the one that created the remote.
 ///
 /// Call sites that only need the "created" signal ignore the `R` via `()`.
+///
+/// Recovery note: the cached remote's [`VoicemeeterApplication`] is captured
+/// once at login. If we logged in while Voicemeeter was unreachable (e.g.
+/// system just woke from sleep and the Voicemeeter process is still coming
+/// back), `program` is latched to `None` and every `strip(i)`/`bus(i)` call
+/// errors with "is not supported on `None`". Dropping the cached remote to
+/// re-login is unsafe — the crate's global logout handle is one-shot, so the
+/// last drop permanently disables `VoicemeeterRemote::new()`. Instead, when
+/// we observe a `None` program we re-run `update_program()` against the live
+/// DLL state; once Voicemeeter is reachable the next call here recovers.
+///
+/// [`VoicemeeterApplication`]: ::voicemeeter::types::VoicemeeterApplication
 #[cfg(windows)]
 pub(crate) fn vm_with<R>(
     holder: &std::sync::Arc<std::sync::Mutex<Option<::voicemeeter::VoicemeeterRemote>>>,
@@ -141,6 +156,13 @@ pub(crate) fn vm_with<R>(
         *guard = Some(v);
         created = true;
     }
+    if let Some(vm) = guard.as_mut() {
+        if vm.program == ::voicemeeter::types::VoicemeeterApplication::None {
+            if let Err(e) = vm.update_program() {
+                debug!("voicemeeter update_program: {e}");
+            }
+        }
+    }
     let vm = guard
         .as_ref()
         .ok_or_else(|| anyhow!("voicemeeter init failed"))?
@@ -152,6 +174,31 @@ pub(crate) fn vm_with<R>(
         f(&vm)
     });
     Ok((out, created))
+}
+
+/// Force-refresh the cached Voicemeeter [`VoicemeeterApplication`] without
+/// rebuilding the remote. Intended for power-resume hooks (mirrors the OBS
+/// client reset in `actions::obs::ensure`): when the OS wakes from sleep we
+/// can't tell whether the Voicemeeter DLL still reports the same application
+/// kind, and the cached value never auto-refreshes after init. This is a
+/// no-op when nothing has been initialised yet — the next `vm_with` will do
+/// a fresh login and discover the program normally.
+///
+/// Dropping + recreating the remote is intentionally avoided: the
+/// [`voicemeeter`] crate auto-logs-out on the last `Drop`, after which
+/// `VoicemeeterRemote::new()` returns `AlreadyLoggedOut` for the rest of
+/// the process lifetime.
+///
+/// [`VoicemeeterApplication`]: ::voicemeeter::types::VoicemeeterApplication
+#[cfg(windows)]
+pub(crate) fn vm_refresh_program(
+    holder: &std::sync::Arc<std::sync::Mutex<Option<::voicemeeter::VoicemeeterRemote>>>,
+) {
+    let mut guard = lock_sync(holder);
+    let Some(vm) = guard.as_mut() else { return };
+    if let Err(e) = with_voicemeeter_io(|| vm.update_program()) {
+        debug!("voicemeeter refresh after resume: update_program failed: {e}");
+    }
 }
 
 #[cfg(windows)]

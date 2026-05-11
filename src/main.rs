@@ -383,6 +383,25 @@ async fn run_session(config_path: &Path, shutdown: &CancellationToken) -> Result
                             if let Err(e) = device::wake(&dev_pw).await {
                                 warn!("wake device input stream: {e:#}");
                             }
+                            // Voicemeeter's cached `VoicemeeterApplication`
+                            // is latched at login and is not refreshed by the
+                            // crate; if Voicemeeter was unreachable when we
+                            // first initialised (or restarted during sleep),
+                            // every strip/bus call errors out with
+                            // "is not supported on `None`". Re-query the DLL
+                            // state now so the first post-wake action / meter
+                            // tick hits a fresh program kind. The cached
+                            // remote itself is reused — dropping it would
+                            // permanently disable login (see
+                            // `actions::voicemeeter::vm_refresh_program`).
+                            #[cfg(windows)]
+                            if let Some(actx) = handle.action_context() {
+                                let holder = actx.vm.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    crate::actions::voicemeeter::vm_refresh_program(&holder)
+                                })
+                                .await;
+                            }
                             let b = handle.configured_brightness();
                             dev_pw.set_brightness(b).await.ok();
                             dev_pw.keep_alive().await.ok();
